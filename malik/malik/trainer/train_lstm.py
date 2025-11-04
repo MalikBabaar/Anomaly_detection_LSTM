@@ -538,12 +538,63 @@ def plot_combo_anomalies(df, outdir):
     plt.savefig(outdir / "combo_anomalies.png")
     plt.close()
 
-def log_sample_anomalies(df, outdir):
-    sample_cols = ["timestamp","service","query","anomaly_score",
-                   "duplicate_id","rare_query","atypical_combo","status_code","request_id"]
-    df_sample = df.sort_values("anomaly_score", ascending=False).head(10)
-    df_sample = df_sample[[c for c in sample_cols if c in df_sample.columns]]
-    df_sample.to_csv(outdir / "sample_anomalies.csv", index=False)
+
+def log_sample_anomalies(
+    df: pd.DataFrame,
+    outdir: Path,
+    top_n: int = 50,
+    top_k_per_service: int = 10
+):
+    """
+    Save handy anomaly samples for quick triage:
+      1) sample_anomalies.csv              -> top N by anomaly_score
+      2) sample_anomalies_by_confidence.csv-> top N by anomaly_confidence
+      3) sample_anomalies_per_service.csv  -> top K per service by anomaly_score
+
+    Also fills blank 'query' values with 'unknown' to avoid empty cells.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Make a working copy and ensure helpful columns exist (no KeyErrors)
+    cols_maybe = [
+        "timestamp","service","system","ip","type",
+        "request_id","session_id","tx_id","sub_tx_id","msisdn",
+        "query",
+        "is_request","is_response","has_error","status_code","status_encoded",
+        "error_spike","duplicate_id","timestamp_burst","query_encoded","rare_query","atypical_combo",
+        "anomaly_score","anomaly_confidence","anomaly_flag"
+    ]
+    have = [c for c in cols_maybe if c in df.columns]
+    dfx = df.copy()
+
+    # Normalize blank query to 'unknown'
+    if "query" in dfx.columns:
+        dfx["query"] = (
+            dfx["query"]
+            .astype(str)
+            .mask(dfx["query"].astype(str).str.strip().eq(""), "unknown")
+            .fillna("unknown")
+        )
+
+    # 1) Top N by anomaly_score
+    if "anomaly_score" in dfx.columns:
+        top_score = dfx.sort_values("anomaly_score", ascending=False).head(top_n)
+        top_score[have].to_csv(outdir / "sample_anomalies.csv", index=False)
+
+    # 2) Top N by anomaly_confidence
+    if "anomaly_confidence" in dfx.columns:
+        top_conf = dfx.sort_values("anomaly_confidence", ascending=False).head(top_n)
+        top_conf[have].to_csv(outdir / "sample_anomalies_by_confidence.csv", index=False)
+
+    # 3) Top K per service by anomaly_score
+    if "service" in dfx.columns and "anomaly_score" in dfx.columns:
+        per_svc = (
+            dfx.sort_values(["service","anomaly_score"], ascending=[True, False])
+            .groupby("service", as_index=False, group_keys=False)
+            .head(top_k_per_service)
+        )
+        per_svc[have].to_csv(outdir / "sample_anomalies_per_service.csv", index=False)
 
 # ----------------- Sequence building over features -----------------
 
@@ -1046,6 +1097,12 @@ def retrain_model(
     outdir.mkdir(parents=True, exist_ok=True)
 
     df_norm = normalize_dataset_columns(df)
+    
+    if "service" in df_norm.columns and "system" in df_norm.columns:
+        _mask = df_norm["service"].astype(str).str.strip().isin(["", "unknown"])
+        if _mask.any():
+            df_norm.loc[_mask, "service"] = df_norm.loc[_mask, "system"].astype(str).str.strip()
+
     ok, msg = validate_dataset(df_norm)
 
     artifacts = {
@@ -1127,7 +1184,7 @@ def retrain_model(
         min_err = float(np.nanmin(df_sorted["anomaly_score"].values))
         df_sorted["anomaly_score"] = df_sorted["anomaly_score"].fillna(min_err)
 
-        # Restore original order
+        # Restore original order (not final yet; we still need confidence)
         df_feats = df_sorted.set_index("index").sort_index()
 
         # --- After training: fit ECDF calibrator on train errors ---
@@ -1136,11 +1193,14 @@ def retrain_model(
         # --- Choose a global fallback threshold (1%) ---
         thr_global = float(np.quantile(raw_tr, 0.99))
 
-        # --- Add per-row confidence ---
-        df_sorted["anomaly_confidence"] = vector_tail_confidence(
+        # --- Add per-row confidence (HIGHER = more anomalous) ---
+        _tail = vector_tail_confidence(
             df_sorted["anomaly_score"].to_numpy().astype(np.float64),
             qvals
         )
+        df_sorted["anomaly_confidence"] = 1.0 - _tail  # <- key change
+
+        # Back to original row order (now includes confidence)
         df_feats = df_sorted.set_index("index").sort_index()
 
         # --- PER-SERVICE thresholds (from train sequences) ---
@@ -1273,8 +1333,30 @@ def retrain_model(
         except Exception:
             pass
 
+       # --- Save scored.csv with clean, stable column order (same style as main) ---
         try:
-            df_feats.to_csv(artifacts["scored"], index=False)
+            ORDER_FIRST = [
+                "timestamp","service","system","ip","type",
+                "request_id","session_id","tx_id","sub_tx_id","msisdn",
+                "query",
+                "is_request","is_response","has_error","status_encoded","error_spike","duplicate_id","timestamp_burst",
+                "query_encoded","rare_query","atypical_combo",
+                "anomaly_score","anomaly_confidence","anomaly_flag",
+                "col10","col11","col12"
+            ]
+
+            _preferred = [c for c in ORDER_FIRST if c in df_feats.columns]
+            _others = [c for c in df_feats.columns if c not in _preferred]
+            df_feats_out = df_feats[_preferred + _others]
+
+            # Optional: normalize typical placeholder tokens to None (cleaner CSV)
+            _placeholders = {"-", "—", "NA", "N/A", "nan", "None", ""}
+            for _c in ["msisdn","session_id","tx_id","sub_tx_id","col10","col11","col12"]:
+                if _c in df_feats_out.columns:
+                    _s = df_feats_out[_c].astype(str).str.strip()
+                    df_feats_out[_c] = _s.where(~_s.isin(_placeholders), None)
+
+            df_feats_out.to_csv(artifacts["scored"], index=False)
         except Exception:
             pass
 
@@ -1293,7 +1375,6 @@ def retrain_model(
             # Training succeeded but MLflow logging failed → return exit_code = 3
             return 3, metrics, {k: str(v) for k, v in artifacts.items()}
 
-        # Success
         return 0, metrics, {k: str(v) for k, v in artifacts.items()}
 
     except Exception as e:
