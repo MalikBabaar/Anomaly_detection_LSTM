@@ -15,6 +15,9 @@ pandas
 scikit-learn
 joblib
 python-multipart
+torch
+torchvision
+torchaudio
 
 # --- MLflow for Experiment Tracking ---
 mlflow

@@ -1,1 +1,0 @@
-models/isolation_forest_20251016_123957.joblib

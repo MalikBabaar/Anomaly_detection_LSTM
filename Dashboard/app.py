@@ -24,7 +24,7 @@ mlflow.set_tracking_uri(TRACKING_URI)
 # Add trainer folder to Python path
 #sys.path.append(str(Path(__file__).resolve().parent.parent / "malik" / "malik" / "trainer"))
 
-API_URL = "http://backend:5000"  # FastAPI backend URL
+API_URL = "http://localhost:5000"  # FastAPI backend URL
 TRAINER_API_URL = "http://trainer_api:9000"
 
 def retrain_via_api_py(uploaded_file,
@@ -445,7 +445,7 @@ else:
 
     # --- ML-FLOW METRICS TAB (plots only) ---
     with tabs[7] if len(tabs) > 7 else st.expander("ML-Flow Metrics"):
-        st.title("ML-Flow Training Metrics (Plots Only)")
+        st.title("ML-Flow Training Metrics")
 
         # Default run id from last retrain, if available
         last_run_id = None

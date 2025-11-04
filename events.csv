@@ -154,3 +154,5 @@ timestamp,source,type,severity,message,status
 2025-10-24T15:20:02.313400+00:00,System,Resource Alert,warning,High memory usage detected: 80.2%,active
 2025-10-24T16:19:42.188223+00:00,JBoss Logs,Anomaly,critical,[2025-09-22 14:35:17] ERROR [org.jboss.ejb3] – Transaction timeout for UserSessionBean,active
 2025-10-24T16:19:47.005728+00:00,JBoss Logs,Anomaly,critical,[2025-09-22 14:35:17] ERROR [org.jboss.ejb3] – Transaction timeout for UserSessionBean,active
+2025-10-27T10:28:56.934323+00:00,JBoss Logs,Anomaly,critical,[2025-09-22 14:35:17] ERROR [org.jboss.ejb3] – Transaction timeout for UserSessionBean,active
+2025-10-27T10:45:07.513330+00:00,System,Resource Alert,warning,High memory usage detected: 80.2%,active

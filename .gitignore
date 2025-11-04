@@ -1,4 +1,3 @@
 venv
-filebeat-7.17.12-amd64.deb
 /data
 malik/malik/trainer/run_streamlit/scored.csv
