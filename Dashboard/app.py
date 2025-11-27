@@ -10,64 +10,50 @@ from mlflow.tracking import MlflowClient
 from pathlib import Path
 from PIL import Image
 import json
+import tempfile
 import mlflow
 import sys
 import os
+import io
 from typing import Optional, List
 
-
-
-# Read from environment; provide a sensible default for file-based tracking
-TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "file:/mlruns")
-mlflow.set_tracking_uri(TRACKING_URI)
-
-# Add trainer folder to Python path
-#sys.path.append(str(Path(__file__).resolve().parent.parent / "malik" / "malik" / "trainer"))
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 API_URL = "http://localhost:5000"  # FastAPI backend URL
-TRAINER_API_URL = "http://trainer_api:9000"
+TRAINER_API_URL = "http://localhost:9000"
 
-def retrain_via_api_py(uploaded_file,
-                       outdir="/data/models/run_upload",
-                       label_col="anomaly_tag",
-                       mlflow_experiment="aiops-anomaly-intelligence"):
-    """
-    Sends the uploaded file to api.py /retrain (multipart/form-data).
-    Returns {ok, exit_code, metrics, artifacts} on success; None otherwise.
-    """
-    if uploaded_file is None:
-        st.error("Please upload a dataset first.")
-        return None
+from malik.malik.trainer.train_lstm import run_training_pipeline
 
-    # Read the file bytes once for upload
-    file_bytes = uploaded_file.getvalue()
-    files = {"file": (uploaded_file.name, file_bytes, "text/csv")}
-    data = {
-        "outdir": outdir,
-        "label_col": label_col,
-        "mlflow_experiment": mlflow_experiment,
-    }
+# Read from environment; provide a sensible default for file-based tracking
+os.environ["MLFLOW_TRACKING_URI"] = "file:///C:/aiops_project_LSTM_Autoencoder/mlruns"
+mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
 
-    try:
-        with st.spinner("Uploading dataset and retraining model…"):
-            resp = requests.post(f"{TRAINER_API_URL.rstrip('/')}/retrain",
-                                 files=files, data=data, timeout=600)
-        if resp.ok:
-            return resp.json()
-        else:
-            st.error(f"Retraining failed [{resp.status_code}]: {resp.text[:500]}")
-            return None
-    except requests.exceptions.Timeout:
-        st.error("The retrain request timed out. Try a smaller file or increase timeout.")
-    except requests.exceptions.ConnectionError as e:
-        st.error(f"Cannot connect to Trainer API: {e}")
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
-    return None
+def retrain_via_api_py(payload, *, outdir="./run_streamlit", seq_len=10, epochs=2, mlflow_experiment="aiops-anomaly-intelligence"):
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="aiops_upload_"))
+    tmpcsv = tmpdir / "uploaded.csv"
+
+    if isinstance(payload, pd.DataFrame):
+        payload.to_csv(tmpcsv, index=False)
+    else:
+        data = payload.getvalue()
+        tmpcsv.write_bytes(data)
+
+    exit_code, metrics, artifacts = run_training_pipeline(
+        df=None,
+        input_paths=[str(tmpcsv)],
+        outdir=outdir,
+        label_col="anomaly_tag",
+        mlflow_experiment=mlflow_experiment,
+        seq_len=seq_len,
+        epochs=epochs,
+    )
+    return {"exit_code": exit_code, "metrics": metrics, "artifacts": artifacts}
 
 # ---------------- CONFIG ---------------- #
 st.set_page_config(page_title="AIOps Dashboard", layout="wide")
-
 
 # ---------------- Helper function ---------------- #
 def get_data(endpoint):
@@ -77,13 +63,11 @@ def get_data(endpoint):
     except Exception as e:
         return {"error": str(e)}
 
-
 # ---------------- SESSION STATE ---------------- #
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "email" not in st.session_state:
     st.session_state.email = ""
-
 
 # ---------------- LOGIN PAGE ---------------- #
 if not st.session_state.authenticated:
@@ -234,26 +218,80 @@ else:
             )
             st.plotly_chart(fig_net, config={"responsive": True}, key="network_chart")
 
-    # --- ML Model Monitoring --- #
+        # --- ML Model Monitoring ---
     with tabs[2]:
         st.title("ML Model Monitoring")
         uploaded_file = st.file_uploader("Upload CSV/TXT logs file", type=["csv", "txt"])
 
-        # Show preview (optional)
+        # Let user indicate if CSV has a header row (helps when logs don't have headers)
+        has_header = st.checkbox("CSV has header row", value=True, help="Uncheck if first row is data, not column names.")
+
+        df_for_retrain = None  # we'll populate this when possible
+
+        # Preview (without adding artificial columns)
         if uploaded_file is not None:
             try:
-                if uploaded_file.name.endswith(".csv"):
-                    _df_preview = pd.read_csv(uploaded_file, engine="python", on_bad_lines="skip")
+                filename = uploaded_file.name.lower()
+
+                if filename.endswith(".csv"):
+                    # Read a small preview from the CSV
+                    _df_preview = pd.read_csv(
+                        uploaded_file,
+                        engine="python",
+                        on_bad_lines="skip",
+                        header=0 if has_header else None,
+                        nrows=5
+                    )
+                    st.dataframe(_df_preview)
+                    # Reset pointer for the full read below
+                    uploaded_file.seek(0)
+
+                    # Read full DataFrame for retraining
+                    df_for_retrain = pd.read_csv(
+                        uploaded_file,
+                        engine="python",
+                        on_bad_lines="skip",
+                        header=0 if has_header else None
+                    )
+                    uploaded_file.seek(0)
+
                 else:
-                    # TXT lines → DataFrame
-                    lines = uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
-                    _df_preview = pd.DataFrame({"log": lines})
-                st.dataframe(_df_preview.head(5))
+                    # TXT: preview raw lines (no DataFrame, no added columns)
+                    text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+                    lines = text.splitlines()
+                    st.caption("Preview (first 5 lines):")
+                    st.code("\n".join(lines[:5]) if lines else "(empty file)")
+
+                    if any("," in ln for ln in lines[:50]):
+                        df_for_retrain = pd.read_csv(
+                            io.StringIO(text), engine="python", on_bad_lines="skip", header=0 if has_header else None
+                        )
+                    elif any("\t" in ln for ln in lines[:50]):
+                        df_for_retrain = pd.read_csv(
+                            io.StringIO(text), engine="python", on_bad_lines="skip", sep="\t", header=0 if has_header else None
+                        )
+                    else:
+                        df_for_retrain = pd.read_csv(
+                            io.StringIO(text), engine="python", on_bad_lines="skip", header=None
+                        )
+
             except Exception:
                 st.info("Preview not available; we’ll still upload the file for training.")
+                try:
+                    uploaded_file.seek(0)
+                except Exception:
+                    pass
 
         if st.button("🔄 Retrain Model", type="primary"):
-            result = retrain_via_api_py(uploaded_file)
+            # Just in case the preview moved the pointer
+            if uploaded_file is not None:
+                try:
+                    uploaded_file.seek(0)
+                except Exception:
+                    pass
+
+            result = retrain_via_api_py(df_for_retrain if df_for_retrain is not None else uploaded_file)
+
             if result:
                 st.session_state["retrain_result"] = result
                 code = result.get("exit_code", -1)
@@ -270,14 +308,13 @@ else:
             st.json({
                 "Precision": metrics.get("precision"),
                 "Recall": metrics.get("recall"),
-                "F1 Score": metrics.get("f1"),
+                "Fbeta Score": metrics.get("fbeta"),
                 "Threshold": metrics.get("threshold"),
                 "Anomaly Rate": metrics.get("anomaly_rate"),
                 "Total Records": metrics.get("total_records"),
             })
         else:
             st.info("Upload a dataset and click Retrain to see metrics.")
-
 
     # --- ANOMALIES TAB --- #
     with tabs[3]:
@@ -464,7 +501,7 @@ else:
 
         st.markdown(f"**MLflow Run ID:** `{run_id}`")
 
-        client = MlflowClient()  # uses MLFLOW_TRACKING_URI
+        client = MlflowClient(tracking_uri="file:///C:/aiops_project_LSTM_Autoencoder/mlruns")
         download_root = Path("/tmp/mlflow_dash")
         download_root.mkdir(parents=True, exist_ok=True)
 
@@ -486,12 +523,12 @@ else:
         st.subheader("Analytics Plots")
 
         plot_candidates = {
-            "Feature Correlation": ["analytics/plots/feature_correlation.png", "static-artifacts/feature_corr.png"],
-            "Anomaly Bursts":      ["analytics/plots/anomaly_bursts.png",     "static-artifacts/anomaly_bursts.png"],
-            "Duplicate IDs":       ["analytics/plots/duplicate_ids.png",      "static-artifacts/duplicate_ids.png"],
-            "Rare Queries":        ["analytics/plots/rare_queries.png",       "static-artifacts/rare_queries.png"],
-            "Gap Anomalies":       ["analytics/plots/gap_anomalies.png",      "static-artifacts/gap_anomalies.png"],
-            "Atypical Combo":      ["analytics/plots/atypical_combo.png",     "static-artifacts/combo_anomalies.png"],
+            "Feature Correlation": ["analytics/plots/feature_correlation.png"],
+            "Anomaly Bursts":      ["analytics/plots/anomaly_bursts.png"],
+            "Gap Anomalies":       ["analytics/plots/gap_anomalies.png"],
+            "Atypical Combo":      ["analytics/plots/atypical_combo.png"],
+            "Duplicate IDs":       ["analytics/plots/duplicate_ids.png"],
+            "Rare Queries":        ["analytics/plots/rare_queries.png"],
         }
 
         cols = st.columns(3, gap="large")
@@ -501,7 +538,7 @@ else:
             with cols[i % 3]:
                 st.markdown(f"**{title}**")
                 if img and img.is_file():
-                    st.image(str(img), use_container_width=True)
+                    st.image(str(img), width="stretch")
                     found_any = True
                 else:
                     st.markdown(f"❌ *{title} not found*")

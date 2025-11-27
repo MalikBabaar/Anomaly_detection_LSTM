@@ -7,6 +7,14 @@ import numbers
 import mlflow
 from mlflow.tracking import MlflowClient
 
+# --- Force MLflow tracking URI to project root ---
+BASE_DIR = Path(__file__).resolve().parents[3]  # points to aiops_project_lstm_autoencoder
+MLFLOW_DIR = BASE_DIR / "mlruns"
+MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
+TRACKING_URI = f"file:///{MLFLOW_DIR}".replace("\\", "/")
+os.environ["MLFLOW_TRACKING_URI"] = TRACKING_URI
+mlflow.set_tracking_uri(TRACKING_URI)
+print(f"[mlflow_logger] Tracking URI set to: {TRACKING_URI}")
 
 def _is_number(x: Any) -> bool:
     """Return True for int/float-like values (incl. numpy scalar types)."""
@@ -109,10 +117,10 @@ def log_mlflow_metrics(
         # Map your local filenames -> canonical artifact names under analytics/plots
         # Local files are created by train.py in `outdir`
         plot_map = {
-            "feature_correlation.png": outdir / "feature_corr.png",
+            "feature_correlation.png": outdir / "feature_correlation.png",
             "anomaly_bursts.png":      outdir / "anomaly_bursts.png",
             "gap_anomalies.png":       outdir / "gap_anomalies.png",
-            "atypical_combo.png":      outdir / "combo_anomalies.png",
+            "atypical_combo.png":      outdir / "atypical_combo.png",
             "duplicate_ids.png":       outdir / "duplicate_ids.png",
             "rare_queries.png":        outdir / "rare_queries.png",
         }

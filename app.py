@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import Gauge, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from sklearn.ensemble import IsolationForest
 from typing import List
-from malik.malik.trainer.train import retrain_model
+from malik.malik.trainer.train_lstm import retrain_model
 from celery_app import retrain_model_task
 from celery.result import AsyncResult
 from fastapi.staticfiles import StaticFiles
@@ -24,18 +24,25 @@ from mlflow.tracking import MlflowClient
 from collections import defaultdict
 import sys
 from pathlib import Path
-
+import mlflow
 
 # Add trainer folder to Python path
 sys.path.append(str(Path(__file__).resolve().parent / "malik" / "malik" / "trainer"))
 
-from train import retrain_model
+from malik.malik.trainer.train_lstm import retrain_model
+
+BASE_DIR = Path(__file__).resolve().parent
+MLFLOW_DIR = BASE_DIR / "mlruns"
+TRACKING_URI = f"file:///{MLFLOW_DIR}".replace("\\", "/")
+os.environ["MLFLOW_TRACKING_URI"] = TRACKING_URI
+mlflow.set_tracking_uri(TRACKING_URI)
+print(f"[main app] Tracking URI: {TRACKING_URI}")
 
 # Add outer project folder to sys.path
 sys.path.append(str(Path(__file__).parent.resolve()))
 sys.path.append(str(Path(__file__).parent / "malik" / "malik"))
 
-from trainer.mlflow_logger import log_mlflow_metrics
+from malik.malik.trainer.mlflow_logger import log_mlflow_metrics
 # ---------------- CONFIG ---------------- #
 load_dotenv()
 with open("config.yaml", "r") as f:
@@ -217,29 +224,6 @@ async def analyze(payload: LogInput):
 
     return JSONResponse(content=result)
 
-
-@app.post("/retrain")
-async def retrain(new_logs: List[LogInput]):
-    try:
-        if not new_logs:
-            raise HTTPException(status_code=400, detail="No logs provided for retraining.")
-
-        # Convert input logs to DataFrame
-        df_features = pd.DataFrame([item.dict() for item in new_logs])
-        if "log" not in df_features.columns:
-            raise HTTPException(status_code=400, detail="Logs must contain a 'log' field.")
-
-        # Call your train.py retrain_model function
-        result = retrain_model(df_features)  # ✅ centralized training + MLflow logging
-
-        return JSONResponse(content=result)
-
-    except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Retrain failed: {e}\n{error_detail}")
-
-
 from fastapi import BackgroundTasks
 from celery_app import celery_app
 
@@ -393,7 +377,6 @@ def list_users():
 
 @app.delete("/users/{email}")
 def delete_user(email: str):
-    """Delete user by email"""
     if not os.path.exists(USERS_FILE):
         raise HTTPException(status_code=404, detail="No users found")
 
