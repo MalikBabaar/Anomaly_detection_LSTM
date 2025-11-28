@@ -577,6 +577,8 @@ def build_features(df: pd.DataFrame, freq_table=None):
             df[c] = 0.0
         df[c] = df[c].astype(float).fillna(0.0)
 
+    print("[DEBUG] build_features final columns:", df.columns)
+
     return df, freq_table
 
 def load_frames(paths):
@@ -885,6 +887,7 @@ def main():
 
     # Train scaler on non-duplicate rows from the TRAIN period only
     df_train = df_sorted.iloc[:split_row].copy()
+
     if "duplicate_id" in df_train.columns:
         df_train = df_train[df_train["duplicate_id"] == 0]
     if df_train.empty:  # fallback
@@ -1376,7 +1379,7 @@ def run_training_pipeline(
         # Load data
         if df is None:
             if not input_paths:
-                input_paths = ["../logcurr.csv", "../logcurr.txt"]
+                input_paths = ["data.csv"]
             frames = load_frames(input_paths)
             if not frames:
                 return 1, {"error": f"No input files found. Checked: {input_paths}"}, {k: str(v) for k, v in artifacts.items()}
@@ -1428,8 +1431,13 @@ def run_training_pipeline(
         except Exception:
             pass
 
+        config = load_config("C:/aiops_project_LSTM_Autoencoder/malik/malik/trainer/config.yaml")
+
+        config["training"]["seq_len"] = int(seq_len)
+        config["training"]["epochs"] = int(epochs)
+
         # Make sequences
-        seqs_all, target_idx = make_service_sequences(df_sorted, X_scaled_sorted, seq_len=seq_len)
+        seqs_all, target_idx = make_service_sequences(df_sorted, X_scaled_sorted, seq_len=config["training"]["seq_len"])
 
         # Labels (optional) aligned to original df order
         y = None
@@ -1462,7 +1470,12 @@ def run_training_pipeline(
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
         # Train
-        model, raw_tr = train_lstm_autoencoder(seqs_tr=seqs_tr, n_features=X_sorted.shape[1], epochs=epochs)
+        model, raw_tr = train_lstm_autoencoder(seqs_tr=seqs_tr, n_features=X_sorted.shape[1], config=config)
+
+        print("[DEBUG] raw_tr length:", len(raw_tr), "finite:", np.isfinite(raw_tr).sum())
+        print("[DEBUG] seqs_tr shape:", seqs_tr.shape)
+        print("[DEBUG] seqs_all shape:", seqs_all.shape)
+        print("[DEBUG] target_idx length:", len(target_idx))
 
         thr, _ = choose_threshold(raw_tr, ytr)
 
@@ -1493,58 +1506,82 @@ def run_training_pipeline(
             lambda r: int(r["anomaly_score"] >= thr_by_service.get(r["service"], thr_global)), axis=1
         )
 
-        # --- Suppress REQUEST when paired RESPONSE is significant (has_error or flagged) ---
-        required = {"service","request_id","is_request","is_response","anomaly_flag","has_error"}
-        if required.issubset(df_feats.columns):
-            # Compute, per (service, request_id), whether any RESPONSE carries strong signal
-            grp_key = ["service","request_id"]
-            resp_signal = (
+            # --- (2) Benign duplicate gate: suppress pure duplicates without error/spike ---
+        _required_cols = {"duplicate_id", "has_error", "error_spike", "anomaly_flag"}
+        if _required_cols.issubset(df_feats.columns):
+            _dup   = df_feats["duplicate_id"].fillna(0).astype(int)
+            _herr  = df_feats["has_error"].fillna(0).astype(int)
+            _spike = df_feats["error_spike"].fillna(0).astype(int)
+
+            _mask_benign_dups = (_dup == 1) & (_herr == 0) & (_spike == 0)
+            df_feats.loc[_mask_benign_dups, "anomaly_flag"] = 0
+
+        # --- (3) Suppress REQUEST when paired RESPONSE has signal (has_error or flagged) ---
+        _required = {"service","request_id","is_request","is_response","anomaly_flag","has_error"}
+        if _required.issubset(df_feats.columns):
+            _grp_key = ["service","request_id"]
+            _resp_signal = (
                 df_feats
-                .assign(
-                    _resp_sig = (
-                        (df_feats["is_response"].astype(int) == 1) &
-                        (
-                            (df_feats["anomaly_flag"].astype(int) == 1) |
-                            (df_feats["has_error"].astype(int) == 1)
-                        )
-                    ).astype(int)
-                )
-                .groupby(grp_key)["_resp_sig"].max()
+                .assign(_resp_sig = (
+                    (df_feats["is_response"].astype(int) == 1) &
+                    (
+                        (df_feats["anomaly_flag"].astype(int) == 1) |
+                        (df_feats["has_error"].astype(int) == 1)
+                    )
+                ).astype(int))
+                .groupby(_grp_key)["_resp_sig"].max()
                 .rename("resp_has_signal")
                 .reset_index()
             )
-
-            df_feats = df_feats.merge(resp_signal, on=grp_key, how="left")
+            df_feats = df_feats.merge(_resp_signal, on=_grp_key, how="left")
             df_feats["resp_has_signal"] = df_feats["resp_has_signal"].fillna(0).astype(int)
 
-            # Suppress requests if a significant response exists for the same (service, request_id)
-            mask_suppress_req = (
+            _mask_suppress_req = (
                 (df_feats["is_request"].astype(int) == 1) &
                 (df_feats["resp_has_signal"] == 1)
             )
-            df_feats.loc[mask_suppress_req, "anomaly_flag"] = 0
+            df_feats.loc[_mask_suppress_req, "anomaly_flag"] = 0
 
-            # (optional) cleanup
+            # clean up helper column
             df_feats.drop(columns=["resp_has_signal"], inplace=True, errors="ignore")
+
+        # --- (4) Suppress request-side duplicates unless they carry extra signal ---
+        _need_cols = {"is_request","duplicate_id","has_error","error_spike",
+                    "rare_query","atypical_combo","anomaly_confidence","anomaly_flag"}
+        if _need_cols.issubset(df_feats.columns):
+            _is_req = (df_feats["is_request"].astype(int) == 1)
+            _dup    = (df_feats["duplicate_id"].astype(int) == 1)
+            _no_err = (df_feats["has_error"].astype(int) == 0)
+
+            # Keep only if rare/atypical OR extremely confident (you can tune 0.999)
+            _keep_req = (
+                (df_feats["rare_query"].astype(int) == 1) |
+                (df_feats["atypical_combo"].astype(int) == 1) |
+                (df_feats["anomaly_confidence"].astype(float) >= 0.999)
+            )
+
+            _mask_req_dup_flagged = _is_req & _dup & _no_err & (df_feats["anomaly_flag"].astype(int) == 1)
+            df_feats.loc[_mask_req_dup_flagged & (~_keep_req), "anomaly_flag"] = 0
 
         # Save model meta (including calibration qvals from training raw_tr)
         qvals = fit_ecdf_quantiles(raw_tr, num=1001)
+        
         model_meta = {
-            "arch": "LSTM_AE",
-            "n_features": X_sorted.shape[1],
-            "hidden_size": 32,
-            "latent_size": 16,
-            "num_layers": 2,
-            "dropout": 0.2,
-            "seq_len": int(seq_len),
-            "device": str(DEVICE),
-            "calibration": {"method": "ecdf_quantiles", "num_points": int(len(qvals)), "qvals": qvals.tolist()},
-            "thresholds": {
-                "mode": "per_service",
-                "global_fallback": thr_global,
-                "per_service": {k: float(v) for k, v in thr_by_service.items()},
-                "quantile": 0.99,
-            },
+                "arch": "LSTM_AE",
+                "n_features": X_sorted.shape[1],
+                "hidden_size": config["model"]["hidden_size"],
+                "latent_size": config["model"]["latent_size"],
+                "num_layers": config["model"]["num_layers"],
+                "dropout": config["model"]["dropout"],
+                "seq_len": int(config["training"]["seq_len"]),
+                "device": str(DEVICE),
+                "calibration": {"method": "ecdf_quantiles", "num_points": int(len(qvals)), "qvals": qvals.tolist()},
+                "thresholds": {
+                    "mode": "per_service",
+                    "global_fallback": thr_global,
+                    "per_service": {k: float(v) for k, v in thr_by_service.items()},
+                    "quantile": 0.99,
+                },
         }
         try:
             with open(artifacts["model_meta"], "w") as f:
@@ -1600,6 +1637,7 @@ def run_training_pipeline(
                 out["atypical_combo_in_anomalies"] = int((df_feats["atypical_combo"].astype(int) == 1)[is_anom].sum())
 
         # --- Evaluate (true labels if available; otherwise masked pseudo) ---
+
         precision = recall = fbeta = None
         metrics_source = None
 
@@ -1649,40 +1687,85 @@ def run_training_pipeline(
 
         except Exception:
             metrics_source = metrics_source or "metrics_failed"
-
+            
         # --- Attach PRF into `out` and update `metrics` once ---
-        
         out["precision"] = float(precision) if precision is not None else 0.0
         out["recall"] = float(recall) if recall is not None else 0.0
         out["fbeta"] = float(fbeta) if fbeta is not None else 0.0
         out["metrics_source"] = metrics_source
 
         metrics.update(out)
+        
+        try:
+            save_feature_correlation(df_feats, outdir)
+        except Exception as e:
+            print("Plot feature_correlation failed", e)
 
-        # (continue with plots/artifacts)
-        save_feature_correlation(df_feats, outdir)
-        save_anomaly_bursts(df_feats, outdir)
-        plot_duplicate_ids(df_feats, outdir)
-        plot_rare_queries(df_feats, outdir)
-        plot_gap_anomalies(df_feats, outdir)
-        plot_combo_anomalies(df_feats, outdir)
-        plot_rolling_feature_trends(df_feats, outdir)
-        plot_burst_distributions(df_feats, outdir)
-        plot_duplicate_patterns(df_feats, outdir)
-        plot_rare_query_frequency(df_feats, outdir)
-        plot_interaction_feature_impact(df_feats, outdir)
-        log_sample_anomalies(df_feats, outdir)
+        try:
+            save_anomaly_bursts(df_feats, outdir)
+        except Exception as e:
+            print("Plot anomaly_bursts failed", e)
+
+        try:
+            plot_duplicate_ids(df_feats, outdir)
+        except Exception as e:
+            print("Plot duplicate_ids failed", e)
+
+        try:
+            plot_rare_queries(df_feats, outdir)
+        except Exception as e:
+            print("Plot rare_queries failed", e)
+
+        try:
+            plot_gap_anomalies(df_feats, outdir)
+        except Exception as e:
+            print("Plot gap_anomalies failed", e)
+
+        try:
+            plot_combo_anomalies(df_feats, outdir)
+        except Exception as e:
+            print("Plot combo_anomalies failed", e)
+
+        try:
+            plot_rolling_feature_trends(df_feats, outdir)
+        except Exception as e:
+            print("Plot rolling_feature_trends failed", e)
+
+        try:
+            plot_burst_distributions(df_feats, outdir)
+        except Exception as e:
+            print("Plot burst_distributions failed", e)
+
+        try:
+            plot_duplicate_patterns(df_feats, outdir)
+        except Exception as e:
+            print("Plot duplicate_patterns failed", e)
+
+        try:
+            plot_rare_query_frequency(df_feats, outdir)
+        except Exception as e:
+            print("Plot rare_query_frequency failed", e)
+
+        try:
+            plot_interaction_feature_impact(df_feats, outdir)
+        except Exception as e:
+            print("Plot interaction_feature_impact failed", e)
+
+        try:
+            log_sample_anomalies(df_feats, outdir)
+        except Exception as e:
+            print("log_sample_anomalies failed", e)
 
         # Persist model (state + metadata) and scored CSV (ordered)
-        try:
+        try:   
             torch.save({
                 "state_dict": model.state_dict(),
                 "n_features": X_sorted.shape[1],
-                "hidden_size": 32,
-                "latent_size": 16,
-                "num_layers": 2,
-                "dropout": 0.2,
-                "seq_len": int(seq_len),
+                "hidden_size": config["model"]["hidden_size"],
+                "latent_size": config["model"]["latent_size"],
+                "num_layers": config["model"]["num_layers"],
+                "dropout": config["model"]["dropout"],
+                "seq_len": int(config["training"]["seq_len"]),
             }, artifacts["model"])
         except Exception:
             pass
@@ -1720,6 +1803,11 @@ def run_training_pipeline(
                 json.dump(metrics, f, indent=2, default=_json_default)
         except Exception:
             pass
+
+        print("[DEBUG] anomaly_flag count:", df_feats["anomaly_flag"].sum())
+        print("[DEBUG] anomaly_score stats:", df_feats["anomaly_score"].min(), df_feats["anomaly_score"].max())
+        print("[DEBUG] ytr:", ytr)
+        print("[DEBUG] yte:", yte)
 
         # MLflow logging
         try:
